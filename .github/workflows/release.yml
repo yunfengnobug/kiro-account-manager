@@ -1,0 +1,149 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  release:
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: windows-latest
+            target: ''
+          - platform: macos-15-intel
+            target: 'x86_64-apple-darwin'
+          - platform: macos-latest
+            target: 'aarch64-apple-darwin'
+          - platform: ubuntu-22.04
+            target: ''
+
+    runs-on: ${{ matrix.platform }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Linux dependencies
+        if: matrix.platform == 'ubuntu-22.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+          cache-on-failure: true
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install dependencies
+        shell: bash
+        run: |
+          rm -rf node_modules package-lock.json
+          npm install
+
+      - name: Update Rust dependencies
+        shell: bash
+        working-directory: src-tauri
+        run: cargo update
+
+      - name: Build and release
+        uses: tauri-apps/tauri-action@v0.6
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          # Linux AppImage 使用 gzip 压缩，兼容旧版 AppImageLauncher
+          APPIMAGETOOL_COMP: ${{ matrix.platform == 'ubuntu-22.04' && 'gzip' || '' }}
+        with:
+          tagName: v__VERSION__
+          releaseName: 'Kiro Account Manager v__VERSION__'
+          releaseBody: '请查看 CHANGELOG 了解更新内容。'
+          releaseDraft: false
+          prerelease: false
+          args: ${{ matrix.target && format('--target {0}', matrix.target) || '' }}
+
+  # 生成 deb 专用的 latest-deb.json
+  generate-deb-json:
+    needs: release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Wait for release assets
+        run: sleep 60
+
+      - name: Download latest.json
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION=${GITHUB_REF#refs/tags/}
+          echo "Downloading latest.json for version: $VERSION"
+          
+          # 先列出 release assets，确认 latest.json 是否存在
+          echo "Listing release assets..."
+          gh release view "$VERSION" --repo yunfengnobug/kiro-account-manager || true
+          
+          # 使用 gh cli 下载，更可靠
+          for i in {1..10}; do
+            echo "Attempt $i: Trying to download latest.json..."
+            if gh release download "$VERSION" --pattern "latest.json" --repo yunfengnobug/kiro-account-manager --clobber 2>/dev/null; then
+              echo "Downloaded successfully"
+              cat latest.json
+              break
+            fi
+            echo "Attempt $i failed, retrying in 20 seconds..."
+            sleep 20
+          done
+          
+          if [ ! -f latest.json ]; then
+            echo "=========================================="
+            echo "ERROR: Failed to download latest.json"
+            echo "This usually means:"
+            echo "  1. TAURI_SIGNING_PRIVATE_KEY is not configured"
+            echo "  2. TAURI_SIGNING_PRIVATE_KEY_PASSWORD is not configured"
+            echo "  3. The signing key is invalid"
+            echo "=========================================="
+            echo "Available release assets:"
+            gh release view "$VERSION" --repo yunfengnobug/kiro-account-manager --json assets --jq '.assets[].name' || true
+            exit 1
+          fi
+
+      - name: Generate latest-deb.json
+        run: |
+          VERSION=${GITHUB_REF#refs/tags/}
+          # 检查 latest.json 是否有效
+          if ! jq empty latest.json 2>/dev/null; then
+            echo "latest.json is not valid JSON"
+            cat latest.json
+            exit 1
+          fi
+          
+          # 读取 latest.json 并修改 linux-x86_64 平台的 URL 为 deb
+          jq --arg ver "$VERSION" '
+            .platforms["linux-x86_64"].url = "https://github.com/yunfengnobug/kiro-account-manager/releases/download/\($ver)/Kiro.Account.Manager_\($ver | ltrimstr("v"))_amd64.deb" |
+            .platforms["linux-x86_64"].signature = (.platforms["linux-x86_64"].signature // "")
+          ' latest.json > latest-deb.json
+          cat latest-deb.json
+
+      - name: Upload latest-deb.json to release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION=${GITHUB_REF#refs/tags/}
+          gh release upload "$VERSION" latest-deb.json --clobber --repo yunfengnobug/kiro-account-manager
+          echo "Successfully uploaded latest-deb.json to release $VERSION"
