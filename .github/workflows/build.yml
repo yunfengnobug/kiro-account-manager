@@ -1,48 +1,145 @@
+# ============================================================================
+# GitHub Actions 工作流配置文件
+# 用途：手动触发构建，生成各平台安装包（不发布，仅上传 Artifacts）
+# 适用场景：Fork 仓库测试、PR 验证、本地无法构建时的替代方案
+# ============================================================================
+
 name: Build (Fork)
 
+# ============================================================================
+# 触发条件配置
+# ============================================================================
 on:
+  # workflow_dispatch: 允许手动触发工作流
+  # 在 GitHub 仓库的 Actions 页面点击 "Run workflow" 按钮即可触发
+  # 私有仓库也可以使用，不需要推送代码
   workflow_dispatch:
 
+# ============================================================================
+# 作业定义
+# ============================================================================
 jobs:
   build:
+    # ------------------------------------------------------------------------
+    # 权限配置
+    # contents: write - 允许写入仓库内容（上传 artifacts 需要）
+    # ------------------------------------------------------------------------
     permissions:
       contents: write
+
+    # ------------------------------------------------------------------------
+    # 构建矩阵策略
+    # strategy.matrix: 定义多个构建配置，GitHub 会并行运行所有配置
+    # fail-fast: false - 某个平台构建失败不会取消其他平台的构建
+    # ------------------------------------------------------------------------
     strategy:
       fail-fast: false
       matrix:
         include:
+          # Windows 构建配置
+          # - 运行环境：windows-latest (Windows Server 2022)
+          # - 产物：.msi 安装包 和 .exe 安装程序
           - platform: windows-latest
+
+          # macOS Intel (x86_64) 构建配置
+          # - 运行环境：macos-latest (macOS 运行器，ARM 架构)
+          # - target: 交叉编译目标为 Intel 架构
+          # - 产物：.dmg 安装包（适用于 Intel Mac）
           - platform: macos-latest
             target: x86_64-apple-darwin
+
+          # macOS Apple Silicon (ARM64) 构建配置
+          # - 运行环境：macos-latest (macOS 运行器，ARM 架构)
+          # - target: 原生编译 ARM 架构
+          # - 产物：.dmg 安装包（适用于 M1/M2/M3 Mac）
           - platform: macos-latest
             target: aarch64-apple-darwin
 
+    # 指定运行器环境，使用矩阵变量动态选择
     runs-on: ${{ matrix.platform }}
 
+    # ------------------------------------------------------------------------
+    # 构建步骤
+    # ------------------------------------------------------------------------
     steps:
+      # ======================================================================
+      # 步骤 1: 检出代码
+      # 将仓库代码克隆到运行器的工作目录
+      # ======================================================================
       - name: Checkout
         uses: actions/checkout@v4
 
+      # ======================================================================
+      # 步骤 2: 配置 Node.js 环境
+      # - node-version: 20 - 使用 Node.js 20 LTS 版本
+      # - cache: 'npm' - 缓存 npm 依赖，加速后续构建
+      #
+      # Tauri 应用的前端部分需要 Node.js 来构建（Vite + React）
+      # ======================================================================
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
           node-version: 20
           cache: 'npm'
 
+      # ======================================================================
+      # 步骤 3: 配置 Rust 编译缓存
+      # - workspaces: src-tauri - 指定 Rust 项目目录
+      # - cache-on-failure: true - 即使构建失败也保存缓存
+      #
+      # Rust 编译很慢，缓存可以显著加速后续构建（从 10+ 分钟降到 2-3 分钟）
+      # 缓存内容：~/.cargo 和 target/ 目录中的编译产物
+      # ======================================================================
       - name: Rust cache
         uses: swatinem/rust-cache@v2
         with:
           workspaces: src-tauri
           cache-on-failure: true
 
+      # ======================================================================
+      # 步骤 4: 安装 Rust 工具链
+      # - 使用 stable 稳定版 Rust
+      # - targets: 指定编译目标架构（用于交叉编译）
+      #   - x86_64-apple-darwin: Intel Mac
+      #   - aarch64-apple-darwin: Apple Silicon Mac
+      #   - 空值时使用默认目标（Windows 使用 x86_64-pc-windows-msvc）
+      # ======================================================================
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
 
+      # ======================================================================
+      # 步骤 5: 安装前端依赖
+      # npm ci: 根据 package-lock.json 精确安装依赖（比 npm install 更快更可靠）
+      #
+      # 安装的主要依赖：
+      # - @tauri-apps/api: Tauri 前端 API
+      # - @tauri-apps/cli: Tauri 命令行工具
+      # - react, vite: 前端框架和构建工具
+      # ======================================================================
       - name: Install dependencies
         run: npm ci
 
+      # ======================================================================
+      # 步骤 6: 构建 Tauri 应用
+      # 使用官方 tauri-action 执行构建流程：
+      #
+      # 构建流程（tauri-action 内部执行）：
+      # 1. npm run build - 构建前端（Vite 打包 React 应用到 dist/）
+      # 2. cargo build --release - 编译 Rust 后端
+      # 3. 打包安装程序（.msi/.exe/.dmg/.AppImage）
+      #
+      # 环境变量：
+      # - GITHUB_TOKEN: GitHub 自动提供，用于 API 访问
+      #
+      # 参数：
+      # - args: 传递给 tauri build 的额外参数
+      #   - --target xxx: 指定编译目标（交叉编译时使用）
+      #
+      # 注意：此步骤不会发布到 Releases，只是构建
+      # 如果要发布，需要添加 tagName 等参数（参见 release.yml）
+      # ======================================================================
       - name: Build
         uses: tauri-apps/tauri-action@v0.6
         env:
@@ -50,6 +147,23 @@ jobs:
         with:
           args: ${{ matrix.target && format('--target {0}', matrix.target) || '' }}
 
+      # ======================================================================
+      # 步骤 7: 上传构建产物
+      # 将构建好的安装包上传为 GitHub Artifacts
+      #
+      # Artifacts vs Releases 的区别：
+      # - Artifacts: 临时存储（默认 90 天），仅在 Actions 页面可下载
+      # - Releases: 永久存储，公开可下载，支持自动更新
+      #
+      # 产物命名格式：build-{platform}-{target}
+      # 例如：build-windows-latest-default, build-macos-latest-aarch64-apple-darwin
+      #
+      # 产物路径：
+      # - Windows: src-tauri/target/release/bundle/ 下的 .msi 和 .exe
+      # - macOS: src-tauri/target/{target}/release/bundle/ 下的 .dmg
+      #
+      # if-no-files-found: warn - 如果没找到文件只警告不报错
+      # ======================================================================
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
@@ -59,3 +173,33 @@ jobs:
             src-tauri/target/release/bundle/**/*.exe
             src-tauri/target/*/release/bundle/**/*.dmg
           if-no-files-found: warn
+
+# ============================================================================
+# 自动更新机制说明（与 release.yml 配合）
+# ============================================================================
+#
+# Tauri 自动更新流程：
+#
+# 1. 应用启动时检查更新：
+#    - 读取 tauri.conf.json 中的 plugins.updater.endpoints
+#    - 访问 https://github.com/.../releases/latest/download/latest.json
+#
+# 2. latest.json 内容示例：
+#    {
+#      "version": "2.0.0",
+#      "platforms": {
+#        "windows-x86_64": {
+#          "url": "https://github.com/.../releases/download/v2.0.0/xxx.msi.zip",
+#          "signature": "xxx"  // 签名，用于验证安装包完整性
+#        }
+#      }
+#    }
+#
+# 3. 如果有新版本，下载并验证签名后安装
+#
+# 重要：
+# - latest.json 由 release.yml 在发布时自动生成
+# - 需要配置 TAURI_SIGNING_PRIVATE_KEY 和 TAURI_SIGNING_PRIVATE_KEY_PASSWORD
+# - 私有仓库的 Releases 无法公开访问，自动更新会失败
+#
+# ============================================================================

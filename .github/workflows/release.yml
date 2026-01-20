@@ -1,66 +1,174 @@
+# ============================================================================
+# GitHub Actions 工作流配置文件
+# 用途：自动构建并发布 Tauri 应用到 GitHub Releases
+# 触发：推送 v* 格式的标签（如 v2.0.0）
+#
+# 完整发布流程：
+# 1. 并行构建 Windows、macOS (Intel/ARM)、Linux 安装包
+# 2. 自动创建 GitHub Release 并上传安装包
+# 3. 生成 latest.json（用于应用内自动更新）
+# 4. 生成 latest-deb.json（Linux deb 包专用更新配置）
+# ============================================================================
+
 name: Release
 
+# ============================================================================
+# 触发条件配置
+# ============================================================================
 on:
   push:
     tags:
+      # 匹配 v 开头的标签，如 v1.0.0, v2.0.0-beta
+      # 触发方式：git tag v2.0.0 && git push origin v2.0.0
       - 'v*'
 
+# ============================================================================
+# 作业 1: release - 构建并发布各平台安装包
+# ============================================================================
 jobs:
   release:
+    # ------------------------------------------------------------------------
+    # 权限配置
+    # contents: write - 允许创建 Release 和上传文件
+    # ------------------------------------------------------------------------
     permissions:
       contents: write
+
+    # ------------------------------------------------------------------------
+    # 构建矩阵策略
+    # 定义 4 个并行构建任务，覆盖主流操作系统
+    # fail-fast: false - 某平台失败不影响其他平台继续构建
+    # ------------------------------------------------------------------------
     strategy:
       fail-fast: false
       matrix:
         include:
+          # Windows 构建配置
+          # - 运行器：windows-latest (Windows Server 2022)
+          # - 产物：.msi 安装包、.exe 安装程序、.nsis.zip（用于自动更新）
           - platform: windows-latest
             target: ''
+
+          # macOS Intel (x86_64) 构建配置
+          # - 运行器：macos-15-intel（专用 Intel Mac 运行器，非交叉编译）
+          # - 产物：.dmg 安装包、.app.tar.gz（用于自动更新）
+          # - 注意：使用专用 Intel 运行器比在 ARM 上交叉编译更稳定
           - platform: macos-15-intel
             target: 'x86_64-apple-darwin'
+
+          # macOS Apple Silicon (ARM64) 构建配置
+          # - 运行器：macos-latest（ARM 架构 M 系列芯片）
+          # - 产物：.dmg 安装包、.app.tar.gz（用于自动更新）
           - platform: macos-latest
             target: 'aarch64-apple-darwin'
+
+          # Linux 构建配置
+          # - 运行器：ubuntu-22.04（固定版本，确保依赖兼容性）
+          # - 产物：.deb 包、.AppImage（便携版）、.AppImage.tar.gz（用于自动更新）
           - platform: ubuntu-22.04
             target: ''
 
+    # 指定运行器环境
     runs-on: ${{ matrix.platform }}
 
+    # ------------------------------------------------------------------------
+    # 构建步骤
+    # ------------------------------------------------------------------------
     steps:
+      # ======================================================================
+      # 步骤 1: 检出代码
+      # ======================================================================
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      # ======================================================================
+      # 步骤 2: 安装 Linux 系统依赖（仅 Linux）
+      # Tauri 在 Linux 上需要以下系统库：
+      # - libwebkit2gtk-4.1-dev: WebView 渲染引擎
+      # - libappindicator3-dev: 系统托盘支持
+      # - librsvg2-dev: SVG 图标支持
+      # - patchelf: 修改 ELF 二进制文件（AppImage 打包需要）
+      # ======================================================================
       - name: Install Linux dependencies
         if: matrix.platform == 'ubuntu-22.04'
         run: |
           sudo apt-get update
           sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
 
+      # ======================================================================
+      # 步骤 3: 配置 Node.js 环境
+      # 用于构建前端（Vite + React）
+      # ======================================================================
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
           node-version: 20
 
+      # ======================================================================
+      # 步骤 4: 配置 Rust 编译缓存
+      # 缓存 Cargo 依赖和编译产物，显著加速后续构建
+      # ======================================================================
       - name: Rust cache
         uses: swatinem/rust-cache@v2
         with:
           workspaces: src-tauri
           cache-on-failure: true
 
+      # ======================================================================
+      # 步骤 5: 安装 Rust 工具链
+      # targets: 指定编译目标（macOS 需要指定具体架构）
+      # ======================================================================
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
 
+      # ======================================================================
+      # 步骤 6: 安装前端依赖
+      # 清理后重新安装，避免缓存导致的兼容性问题
+      # ======================================================================
       - name: Install dependencies
         shell: bash
         run: |
           rm -rf node_modules package-lock.json
           npm install
 
+      # ======================================================================
+      # 步骤 7: 更新 Rust 依赖
+      # 确保使用最新的依赖版本，修复已知安全漏洞
+      # ======================================================================
       - name: Update Rust dependencies
         shell: bash
         working-directory: src-tauri
         run: cargo update
 
+      # ======================================================================
+      # 步骤 8: 构建并发布到 GitHub Releases
+      #
+      # 这是核心步骤，tauri-action 会：
+      # 1. 执行 npm run build（构建前端）
+      # 2. 执行 cargo build --release（编译 Rust 后端）
+      # 3. 打包各平台安装程序
+      # 4. 对安装包进行签名（需要 TAURI_SIGNING_PRIVATE_KEY）
+      # 5. 生成 latest.json（包含版本信息、下载 URL、签名）
+      # 6. 创建/更新 GitHub Release 并上传所有文件
+      #
+      # 环境变量说明：
+      # - GITHUB_TOKEN: GitHub 自动提供，用于创建 Release 和上传文件
+      # - TAURI_SIGNING_PRIVATE_KEY: 签名私钥（需在 Secrets 中配置）
+      #   用于对安装包签名，客户端更新时验证完整性
+      # - TAURI_SIGNING_PRIVATE_KEY_PASSWORD: 私钥密码
+      # - APPIMAGETOOL_COMP: Linux AppImage 压缩算法
+      #   使用 gzip 而非默认的 zstd，兼容旧版 AppImageLauncher
+      #
+      # with 参数说明：
+      # - tagName: Release 标签名，__VERSION__ 会替换为 tauri.conf.json 中的版本
+      # - releaseName: Release 标题
+      # - releaseBody: Release 描述
+      # - releaseDraft: false - 直接发布，不是草稿
+      # - prerelease: false - 正式版本，不是预发布
+      # - args: 传递给 tauri build 的参数，指定编译目标
+      # ======================================================================
       - name: Build and release
         uses: tauri-apps/tauri-action@v0.6
         env:
@@ -77,27 +185,58 @@ jobs:
           prerelease: false
           args: ${{ matrix.target && format('--target {0}', matrix.target) || '' }}
 
-  # 生成 deb 专用的 latest-deb.json
+  # ==========================================================================
+  # 作业 2: generate-deb-json - 生成 Linux deb 包专用更新配置
+  # ==========================================================================
+  #
+  # 背景说明：
+  # Tauri 默认的 latest.json 中，Linux 平台指向 AppImage 格式
+  # 但有些用户更喜欢使用 .deb 包（可以通过 apt 管理）
+  # 此作业生成一个 latest-deb.json，将 Linux 下载链接指向 .deb 文件
+  #
+  # 使用方式：
+  # 用户可以在 tauri.conf.json 中将 updater.endpoints 改为：
+  # "https://github.com/.../releases/latest/download/latest-deb.json"
+  # 这样自动更新就会下载 .deb 而不是 AppImage
+  # ==========================================================================
   generate-deb-json:
+    # 依赖 release 作业完成后才执行
     needs: release
     runs-on: ubuntu-latest
     permissions:
       contents: write
+
     steps:
+      # ======================================================================
+      # 步骤 1: 等待 Release 资源上传完成
+      # tauri-action 上传文件是异步的，需要等待一段时间
+      # ======================================================================
       - name: Wait for release assets
         run: sleep 60
 
+      # ======================================================================
+      # 步骤 2: 下载 latest.json
+      # 从刚创建的 Release 中下载 tauri-action 生成的 latest.json
+      #
+      # 重试机制：最多尝试 10 次，每次间隔 20 秒
+      # 因为文件上传可能有延迟
+      #
+      # 如果下载失败，通常是因为：
+      # 1. TAURI_SIGNING_PRIVATE_KEY 未配置或无效
+      # 2. TAURI_SIGNING_PRIVATE_KEY_PASSWORD 错误
+      # 3. tauri.conf.json 中 createUpdaterArtifacts 未启用
+      # ======================================================================
       - name: Download latest.json
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           VERSION=${GITHUB_REF#refs/tags/}
           echo "Downloading latest.json for version: $VERSION"
-          
+
           # 先列出 release assets，确认 latest.json 是否存在
           echo "Listing release assets..."
           gh release view "$VERSION" --repo yunfengnobug/kiro-account-manager || true
-          
+
           # 使用 gh cli 下载，更可靠
           for i in {1..10}; do
             echo "Attempt $i: Trying to download latest.json..."
@@ -109,7 +248,7 @@ jobs:
             echo "Attempt $i failed, retrying in 20 seconds..."
             sleep 20
           done
-          
+
           if [ ! -f latest.json ]; then
             echo "=========================================="
             echo "ERROR: Failed to download latest.json"
@@ -123,6 +262,26 @@ jobs:
             exit 1
           fi
 
+      # ======================================================================
+      # 步骤 3: 生成 latest-deb.json
+      # 使用 jq 修改 latest.json：
+      # - 将 linux-x86_64 平台的 URL 从 AppImage 改为 .deb
+      # - 保留其他平台配置不变
+      #
+      # latest.json 结构示例：
+      # {
+      #   "version": "2.0.0",
+      #   "platforms": {
+      #     "linux-x86_64": {
+      #       "url": "https://.../xxx.AppImage.tar.gz",
+      #       "signature": "签名字符串"
+      #     },
+      #     "windows-x86_64": { ... },
+      #     "darwin-x86_64": { ... },
+      #     "darwin-aarch64": { ... }
+      #   }
+      # }
+      # ======================================================================
       - name: Generate latest-deb.json
         run: |
           VERSION=${GITHUB_REF#refs/tags/}
@@ -132,7 +291,7 @@ jobs:
             cat latest.json
             exit 1
           fi
-          
+
           # 读取 latest.json 并修改 linux-x86_64 平台的 URL 为 deb
           jq --arg ver "$VERSION" '
             .platforms["linux-x86_64"].url = "https://github.com/yunfengnobug/kiro-account-manager/releases/download/\($ver)/Kiro.Account.Manager_\($ver | ltrimstr("v"))_amd64.deb" |
@@ -140,6 +299,10 @@ jobs:
           ' latest.json > latest-deb.json
           cat latest-deb.json
 
+      # ======================================================================
+      # 步骤 4: 上传 latest-deb.json 到 Release
+      # --clobber: 如果文件已存在则覆盖
+      # ======================================================================
       - name: Upload latest-deb.json to release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -147,3 +310,44 @@ jobs:
           VERSION=${GITHUB_REF#refs/tags/}
           gh release upload "$VERSION" latest-deb.json --clobber --repo yunfengnobug/kiro-account-manager
           echo "Successfully uploaded latest-deb.json to release $VERSION"
+
+# ============================================================================
+# 自动更新机制详解
+# ============================================================================
+#
+# 【签名密钥生成】
+# 在本地运行以下命令生成密钥对：
+#   npx @tauri-apps/cli signer generate -w ~/.tauri/kiro-account-manager.key
+#
+# 会生成两个文件：
+# - ~/.tauri/kiro-account-manager.key（私钥，保密！配置到 GitHub Secrets）
+# - ~/.tauri/kiro-account-manager.key.pub（公钥，配置到 tauri.conf.json）
+#
+# 【GitHub Secrets 配置】
+# 进入仓库 Settings → Secrets and variables → Actions，添加：
+# - TAURI_SIGNING_PRIVATE_KEY: 私钥文件的完整内容
+# - TAURI_SIGNING_PRIVATE_KEY_PASSWORD: 生成密钥时设置的密码
+#
+# 【客户端更新流程】
+# 1. 应用启动时，读取 tauri.conf.json 中的 plugins.updater.endpoints
+# 2. 请求 latest.json，获取最新版本信息
+# 3. 比较版本号，如果有新版本：
+#    a. 下载对应平台的安装包（.nsis.zip / .app.tar.gz / .AppImage.tar.gz）
+#    b. 使用公钥验证签名，确保文件未被篡改
+#    c. 解压并安装更新
+#
+# 【私有仓库注意事项】
+# 私有仓库的 Releases 无法公开访问，latest.json 会返回 404
+# 解决方案：
+# 1. 将仓库改为公开
+# 2. 自建更新服务器，托管 latest.json 和安装包
+# 3. 使用 GitHub API + Personal Access Token 实现认证下载
+#
+# 【发布新版本步骤】
+# 1. 更新 package.json 和 tauri.conf.json 中的版本号
+# 2. 提交更改：git commit -am "chore: bump version to x.x.x"
+# 3. 创建标签：git tag vx.x.x
+# 4. 推送：git push origin main --tags
+# 5. GitHub Actions 自动开始构建和发布
+#
+# ============================================================================
